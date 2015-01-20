@@ -1,0 +1,367 @@
+<?xml version="1.0"?>
+<project name="dbVersionManager" basedir="." default="help">
+
+    <!-- Global Properties -->
+    <property name="db.properties" value="db.properties"/>
+    <property name="db.properties.depth" value=".."/>
+    <property name="fSep" value="${file.separator}"/>
+    <property name="antContrib" value="lib${file.separator}ant-contrib-1.0b3.jar"/>
+
+    <!-- Switchable properties -->
+    <!-- NOTE: Having these properties exist in any way causes the unless condition to pass!
+    <property name="dontCleanProperties" value=""/>
+    <property name="dontRunPackages" value=""/>
+    -->
+
+    <!-- Define Ant-Contrib -->
+    <taskdef resource="net/sf/antcontrib/antcontrib.properties">
+        <classpath>
+          <pathelement location="${antContrib}"/>
+        </classpath>
+    </taskdef>
+
+    <!-- Begin Run Target Definitions -->
+    <target name="standardRun" depends="_loadDbProperties,getAppliedScripts,compareFStoDB,reRunCreateOrReplaces,invalidDbObjectCount"></target>
+    <target name="deltasOnly" depends="_loadDbProperties,getAppliedScripts,compareFStoDB,invalidDbObjectCount"></target>
+    <target name="packagesOnly" depends="_loadDbProperties,reRunCreateOrReplaces,invalidDbObjectCount"></target>
+    <!-- End Run Target Definitions -->
+
+    <!-- Begin Work Target Definitions -->
+    <target name="_dbman.properties.exist?">
+        <available file="${dbman.tmp.properties}" property="dbman.properties.exists"/>
+        <fail unless="dbman.properties.exists" message="The applied scripts information (in: ${dbman.tmp.properties}) is not available. Cannot continue."/>
+    </target>
+
+    <target name="_db.connection?">
+        <!-- This doesn't seem to work for some reason, so use -DdontCleanProperties=true instead (for now) -->
+        <fail if="db.connectionFailed" message="Cannot delete old ${dbman.tmp.properties} if DB connection failed"/>
+    </target>
+
+    <target name="_cleanProperties" unless="dontCleanProperties">
+        <antcall target="_db.connection?"/>
+        <delete file="dbman.tmp.properties"/>
+    </target>
+
+    <target name="_loadDbProperties">
+        <fail unless="configuration.directory" message="configuration.directory was not specified either in the build.properties or on the command line"/>
+
+        <!--
+            The following allows us to take into account both the (../server/conf/*) and (../conf/*) directory structures.
+            All of the ${toString:x} are because the path 'id' is not a true ant property
+        -->
+        <path id="config.db.properties">
+          <fileset dir="${db.properties.depth}">
+            <filename name="**${file.separator}conf${file.separator}${configuration.directory}${file.separator}${db.properties}"/>
+          </fileset>
+        </path>
+
+        <echo message="About to look for ${db.properties} at: ${toString:config.db.properties}"/>
+        <available property="config.db.exists" file="${toString:config.db.properties}" />
+        <fail unless="config.db.exists" message="Could not find '${db.properties.depth}${file.separator}**${file.separator}conf${file.separator}${configuration.directory}${file.separator}${db.properties}', Exiting."/>
+
+        <property file="${toString:config.db.properties}"/>
+        <echo message="${db.properties} Loaded. Pertinent Info - Host: ${db.host}, SID: ${db.sid}, Schema: ${db.user}"/>
+    </target>
+
+    <target name="getAppliedScripts">
+        <echo message=" Connecting to '${db.user}/${db.password}@${db.host}:${db.port}:${db.sid}'"/>
+        <!-- NB: SQL is wrapped in CDATA to avoid having to escape <, >, &, or any other XML special character -->
+        <sql
+            classpath="${oracle.jar}" driver="oracle.jdbc.OracleDriver"
+            print="true"
+            failOnConnectionError="false"
+            warningproperty="db.connectionFailed"
+            output="${dbman.tmp.properties}"
+            showheaders="false"
+            showtrailers="false"
+            url="jdbc:oracle:thin:@${db.host}:${db.port}/${db.sid}"
+            userid="${db.user}"
+            password="${db.password}"><![CDATA[
+            -- Restart Script Indexes At Each Version
+            --SELECT 'dbman.' || Version_ID || '.' || RANK() OVER (PARTITION BY Version_ID ORDER BY script_applied) || '.script=' || script_applied
+            --FROM DB_Version
+            --WHERE Version_ID <= ${db.max.version};
+
+            -- Continue Script Indexes Across Versions
+            SELECT 'dbman.' || Version_ID || '.' || RANK() OVER (ORDER BY script_applied) || '.script=' || script_applied
+            FROM DB_Version
+            WHERE Version_ID <= ${db.max.version};
+            ]]></sql>
+
+        <antcall target="_dbman.properties.exist?"/>
+        <property file="${dbman.tmp.properties}"/>
+        <antcall target="_cleanProperties"/>
+
+        <propertyselector property="dbVersions.list"
+            delimiter=","
+            match="dbman\.([\d]+)\.([\d]+)\.script"
+            select="\1"
+            casesensitive="false" />
+        <propertyselector property="appliedScripts.list"
+            delimiter=","
+            match="dbman\.([\d]+)\.([\d]+)\.script"
+            select="\2"
+            casesensitive="false" />
+
+    </target>
+
+    <target name="reRunCreateOrReplaces" unless="dontRunPackages">
+        <sql
+            classpath="${oracle.jar}" driver="oracle.jdbc.OracleDriver"
+            print="true"
+            showheaders="false"
+            showtrailers="false"
+            delimiter="/"
+            delimitertype="row"
+            keepformat="true"
+            url="jdbc:oracle:thin:@${db.host}:${db.port}/${db.sid}"
+            userid="${db.user}"
+            password="${db.password}">
+                <path>
+                    <fileset dir="${db.base.dir}${file.separator}packages">
+                        <include name="*.sql"/>
+                    </fileset>
+                </path>
+        </sql>
+    </target>
+
+    <target name="_reCompileSchema">
+        <echo message="Re-Compiling Schema Objects..."/>
+        <!-- NB: SQL is wrapped in CDATA to avoid having to escape <, >, &, or any other XML special character -->
+        <sql
+            classpath="${oracle.jar}" driver="oracle.jdbc.OracleDriver"
+            print="true"
+            showheaders="false"
+            showtrailers="false"
+            url="jdbc:oracle:thin:@${db.host}:${db.port}/${db.sid}"
+            userid="${db.user}"
+            password="${db.password}"><![CDATA[
+                {CALL dbms_utility.compile_schema(USER)}
+            ]]></sql>
+    </target>
+
+    <target name="invalidDbObjectCount" depends="_reCompileSchema">
+        <echo message="Getting count of invalid objects..."/>
+        <!-- NB: SQL is wrapped in CDATA to avoid having to escape <, >, &, or any other XML special character -->
+        <sql
+            classpath="${oracle.jar}" driver="oracle.jdbc.OracleDriver"
+            output="invalidObjectCount.tmp.properties"
+            print="true"
+            showheaders="false"
+            showtrailers="false"
+            url="jdbc:oracle:thin:@${db.host}:${db.port}/${db.sid}"
+            userid="${db.user}"
+            password="${db.password}"><![CDATA[
+                select 'db.schema.invalid.objects=' || count(*) as invalid_objects from user_objects where status = 'INVALID';
+            ]]></sql>
+
+        <property file="invalidObjectCount.tmp.properties"/>
+        <delete file="invalidObjectCount.tmp.properties"/>
+
+        <condition property="_noInvalidObjects">
+            <equals arg1="${db.schema.invalid.objects}" arg2="0" trim="true"/>
+        </condition>
+        <fail message="Failing script due to finding invalid objects in the database." unless="_noInvalidObjects" />
+    </target>
+
+    <target name="compareFStoDB">
+        <script language="javascript"> <![CDATA[
+            importPackage(java.io);
+            fSep = project.getProperty("fSep");
+
+            /* For some reason, this doesn't work on Windows...
+            Array.prototype.unique = function(){
+                return Object.keys(this.reduce(function(r,v){
+                    return r[v]=1,r;
+                },{}));
+            }
+            */
+
+            Array.prototype.unique = function(){
+                var u = {}, a = [];
+                for(var i = 0, l = this.length; i < l; ++i){
+                    if(u.hasOwnProperty(this[i])) {
+                        continue;
+                    }
+                    a.push(this[i]);
+                    u[this[i]] = 1;
+                }
+
+                return a;
+            }
+
+            function logToScreen(message, logLevel){
+                if (message === undefined) {
+                    return false;
+                } else {
+                    echo = project.createTask("echo");
+                    echoLevel = Packages.org.apache.tools.ant.taskdefs.Echo.EchoLevel();
+
+                    if (logLevel === undefined) {
+                        echoLevel.setValue("warning"); //"warning" is Ant's default echo level
+                    } else {
+                        echoLevel.setValue(logLevel); //"warning" is Ant's default echo level
+                    }
+
+                    echo.setLevel(echoLevel); //Change to the specified echo level
+                    echo.setMessage(message);
+                    echo.perform();
+                    echoLevel.setValue("warning"); //Return to default echo level
+                    echo.setLevel(echoLevel);
+                }
+            }
+
+            function howManyRemainingDeltas() {
+                if (availableDeltas.length == 0) { //The database is up-to-date
+                    logToScreen("There are no deltas <= maxVersion (" + maxVersion + ") to be applied.");
+                } else if (availableDeltas.length > 0) { //There are deltas that still need to be applied
+                    logToScreen("There are " + availableDeltas.length + " deltas that have not been applied.\nAvailable Deltas: " + availableDeltas.toString());
+                } else { //Something has gone wrong...
+                    logToScreen("The number of availableDeltas is: " + availableDeltas.length + ". You should have 0 or greater.....");
+                }
+            }
+
+            function applyMissingScripts() {
+                //Apply remaining availableDeltas where deltaVersion <= maxVersion
+                logToScreen("Starting application of remaining deltas (" + availableDeltas.toString() + ") to database.");
+                delimiterType = Packages.org.apache.tools.ant.taskdefs.SQLExec.DelimiterType();
+                    delimiterType.setValue("row");
+                sqlJarClasspath = project.createDataType("path");
+                    sqlJarClasspath.setPath(new File(project.getProperty("oracle.jar")));
+
+                for (var i = 0; i < availableDeltas.length; i++){
+                var currentDeltaFullPath = project.getProperty("db.base.dir") + fSep +"version" + project.getProperty("releaseVersion") + fSep + "deltas" + fSep + availableDeltas[i];
+                    logToScreen("Full path of current delta: " + currentDeltaFullPath);
+
+                    sqlTask = project.createTask("sql");
+                        sqlTask.setClasspath(sqlJarClasspath);
+                        sqlTask.setDriver("oracle.jdbc.OracleDriver");
+                        sqlTask.setPrint(true);
+                        sqlTask.setShowheaders(false);
+                        sqlTask.setShowtrailers(false);
+                        sqlTask.setDelimiter("/");
+                        sqlTask.setDelimiterType(delimiterType);
+                        sqlTask.setUrl("jdbc:oracle:thin:@" + project.getProperty("db.host") + ":" + project.getProperty("db.port") + ":" + project.getProperty("db.sid"));
+                        sqlTask.setUserid(project.getProperty("db.user"));
+                        sqlTask.setPassword(project.getProperty("db.password"));
+                        sqlTask.setSrc(new File(currentDeltaFullPath));
+                    sqlTask.perform();
+                    availableDeltas.splice(i,1);
+                    i--;
+                }
+                howManyRemainingDeltas();
+            }
+
+            //Important Variables -- Pulled from DB, or FS, or Ant Project in General
+            var maxVersion = project.getProperty("db.max.version");
+            var deltaSqlDirectory = project.getProperty("db.base.dir") + fSep + "version" + project.getProperty("releaseVersion") + fSep + "deltas";
+                fs = project.createDataType("fileset");
+                    fs.setDir(new File(deltaSqlDirectory));
+                    fs.setIncludes("**" + fSep + "*.sql");
+            try {
+                var availableDeltas = fs.getDirectoryScanner(project).getIncludedFiles().sort().unique();
+            } catch (err) {
+                logToScreen("Available Deltas Error: " + err);
+            }
+            try {
+                var dbVersions = project.getProperty("dbVersions.list").split(",").sort().unique();
+            } catch (err) {
+                logToScreen("No Versions fetched from DB. Creating empty dbVersions array.");
+                var dbVersions = [];
+            }
+            try {
+                var appliedScripts = project.getProperty("appliedScripts.list").split(",").sort().unique();
+            } catch (err) {
+                logToScreen("No Applied Scripts fetched from DB. Creating empty appliedScripts array.");
+                var appliedScripts = [];
+            }
+
+            logToScreen("Initially Available Deltas (" + availableDeltas.length + " total): " + availableDeltas.toString(), "verbose");
+            logToScreen("Initially Available Versions (" + dbVersions.length + " total): " + dbVersions.toString(), "verbose")
+
+            //Eliminating versions > maxVersion from the dbVersions Array
+            logToScreen("Starting Compare of maxVersion (" + maxVersion + ") with dbVersions: (" + dbVersions.toString() + ")");
+            for (var i = 0; i <= dbVersions.length; i++) {
+                if(dbVersions[i] > maxVersion) {
+                    logToScreen("Current Version (" + dbVersions[i] + ") is greater than maxVersion ("+ maxVersion + "). Removing.", "verbose");
+                    dbVersions.splice(i,1);
+                    i--;
+                }
+            }
+
+            //Eliminating deltas > maxVersion from the availableDeltas Array
+            logToScreen("Starting Compare of maxVersion (" + maxVersion + ") with availableDeltas: (" + availableDeltas.toString() + ")");
+            var deltaBreakdownPattern = /([0-9]+)_([0-9]+)_([A-Za-z0-9_\-\.]+)/;
+            for (var i = 0; i < availableDeltas.length; i++) {
+                logToScreen("Current Delta to break down: " + availableDeltas[i], "verbose");
+
+                var brokenDownDelta = availableDeltas[i].match(deltaBreakdownPattern); //brokenDownDelta[0] contains the whole matched string, [1] contains the first group match, etc.
+                var currentDeltaVersion = brokenDownDelta[1];
+                var currentDeltaSequence = brokenDownDelta[2];
+                var currentDeltaScriptOnly = brokenDownDelta[3];
+
+                if(currentDeltaVersion > maxVersion) {
+                    logToScreen("Current Delta (" + availableDeltas[i] + ") is greater than maxVersion ("+ maxVersion + "). Removing.", "verbose");
+                    availableDeltas.splice(i,1);
+                    i--;
+                }
+            }
+
+            logToScreen("Pre-Loop Available Deltas (" + availableDeltas.length + " total): " + availableDeltas.toString(), "verbose");
+            logToScreen("Pre-Loop Available Versions (" + dbVersions.length + " total): " + dbVersions.toString(), "verbose")
+
+            logToScreen("**********\nThere are " + availableDeltas.length + " availableDeltas, and " + appliedScripts.length + " appliedScripts across " + dbVersions.length + " dbVersions\n**********");
+
+            //Loop through availableDeltas, dbVersions, and appliedScripts to determine which scripts that are available have already been applied
+            availableDeltasLoop:
+            for (var deltasIndex = 0; deltasIndex <= availableDeltas.length; deltasIndex++) { //Loop through all available deltas
+                if (availableDeltas.length == 0) { //All available deltas are accounted for
+                    break availableDeltasLoop;
+                }
+                logToScreen("In availableDeltasLoop. Current Delta: " + availableDeltas[deltasIndex]  + ". Delta Index: " + deltasIndex, "verbose");
+
+                versionsLoop:
+                for (var versionsIndex = 0; versionsIndex <= dbVersions.length; versionsIndex++) { //Inner loop through all available versions
+                    logToScreen("In versionsLoop. Current Version: " + dbVersions[versionsIndex] + ". Version Index: " + versionsIndex, "verbose");
+
+                    appliedScriptsLoop:
+                    for (var scriptsIndex = 0; scriptsIndex <= appliedScripts.length; scriptsIndex++) { //Inner-Inner loop through all scripts
+                        logToScreen("In appliedScriptsLoop. Current Script: " + appliedScripts[scriptsIndex] + ". Script Index: " + scriptsIndex, "verbose");
+
+                        var currentScript = String(project.getProperty("dbman." + dbVersions[versionsIndex] + "." + appliedScripts[scriptsIndex] + ".script"));
+                        if (currentScript != null) { //The current script exists within the current version, and has been applied to the database
+                            logToScreen("The script: " + currentScript + " exists within the current version (" + dbVersions[versionsIndex] + ")", "verbose");
+
+                            if (currentScript == availableDeltas[deltasIndex]){
+                                logToScreen("Current script (" + currentScript + ") matches current delta (" + availableDeltas[deltasIndex] + ")");
+
+                                //Remove from appliedScripts, and availableDeltas
+                                appliedScripts.splice(scriptsIndex,1);
+                                availableDeltas.splice(deltasIndex,1);
+
+                                logToScreen("Number of available deltas: " + availableDeltas.length + ". Number of scripts applied: " + appliedScripts.length);
+
+                                // Decrement index by 1 (instead of setting to 0 explicitly) so that when we
+                                // 'continue', the auto-increment leaves us in the original position (ie: 0)
+                                deltasIndex--;
+
+                                //Break back to availableDeltasLoop
+                                continue availableDeltasLoop;
+                            }
+                        }
+                    }
+                }
+            }
+            howManyRemainingDeltas();
+
+            var dontApplyMissingScripts = String(project.getProperty("dontApplyMissingScripts"));
+            if (dontApplyMissingScripts == 'false') {
+                applyMissingScripts();
+            } else {
+                logToScreen("dontApplyMissingScripts is set to 'true' skipping step of applying the scripts");
+            }
+
+        ]]></script>
+    </target>
+    <!-- End Work Target Definitions -->
+</project>
